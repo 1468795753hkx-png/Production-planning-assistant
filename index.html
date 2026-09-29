@@ -121,6 +121,7 @@
       <span><i style="background:var(--acc2)"></i>计划产量</span>
       <span><i style="background:var(--violet)"></i>周产能</span>
     </div>
+    <div class="note" id="demNote" style="margin-top:8px;"></div>
   </div>
 
   <div class="grid2">
@@ -500,6 +501,20 @@ function render(mult, capacity) {
     });
   }
   groupBars('prodChart', dRows);
+
+  // 需求明细（A/B/C 每周需求）
+  {
+    const dm = {};
+    ACTIVE_ORDERS.forEach(o => { dm[o.product] = dm[o.product] || {}; dm[o.product][o.week] = (dm[o.product][o.week] || 0) + o.qty; });
+    let txt = '需求明细（每周）｜ ';
+    PRODUCTS.forEach(p => {
+      txt += `${p}：`;
+      for (let w = 1; w <= N_WEEKS; w++) { txt += (dm[p] && dm[p][w]) ? fmt(dm[p][w]) : '0'; if (w < N_WEEKS) txt += ' / '; }
+      txt += '　';
+    });
+    txt += (USE_FORECAST ? '（预测需求）' : '（既有订单）');
+    document.getElementById('demNote').textContent = txt;
+  }
 
   // 成品生产明细表
   let pt = `<table><thead><tr><th>产品</th>` + Array.from({length:N_WEEKS}, (_, i) => `<th>W${i+1}</th>`).join('') + `<th>合计</th></tr></thead><tbody>`;

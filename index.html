@@ -66,6 +66,23 @@
     <div class="chip">Phase 1 · MRP Demo</div>
   </header>
 
+  <div class="panel" id="fcPanel">
+    <h2>需求预测（Demand Forecasting）｜预测 → 计划</h2>
+    <p class="sub">基于近 12 周历史销量，用轻量时间序列（Holt 线性趋势 / 线性回归）预测未来 4 周需求；可切换“用预测需求驱动计划”，让 AI 依据需求趋势主动调整备货。</p>
+    <div class="chart" id="fcChart"></div>
+    <div class="legend">
+      <span><i style="background:var(--accent)"></i>P-A</span>
+      <span><i style="background:var(--acc2)"></i>P-B</span>
+      <span><i style="background:var(--violet)"></i>P-C</span>
+      <span>实线=历史 · 虚线=预测</span>
+    </div>
+    <div class="scroll" id="fcTable"></div>
+    <label style="display:inline-flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer;color:var(--text);font-size:13px;">
+      <input type="checkbox" id="useForecast"> 使用预测需求替代既有订单（AI 依需求趋势主动调整计划）
+    </label>
+    <div class="note" id="fcSource"></div>
+  </div>
+
   <div class="panel">
     <div class="controls">
       <div>
@@ -130,6 +147,22 @@
     <h2>采购计划汇总</h2>
     <p class="sub">按物料汇总净需求、建议采购量与采购成本。</p>
     <div class="scroll" id="poTable"></div>
+  </div>
+
+  <div class="panel" id="poGovernPanel">
+    <h2>采购订单生成与分级（Auto vs 人工审批）</h2>
+    <p class="sub">把采购建议落地为采购订单，并按“低风险 AI 自动放单 / 高风险人工审批”分级——AI 处理标准补货，人负责关键与高风险单。</p>
+    <div class="controls" style="margin-bottom:12px;">
+      <div>
+        <label>自动放单金额上限（€）</label>
+        <input type="number" id="autoCap" value="30000" min="0" step="1000" style="width:110px;">
+      </div>
+      <div class="kpi" style="padding:10px 14px;flex:0 0 auto;"><div class="label">AI 自动放单</div><div class="val acc" id="poAutoCount" style="font-size:18px;">-</div></div>
+      <div class="kpi" style="padding:10px 14px;flex:0 0 auto;"><div class="label">需人工审批</div><div class="val warn" id="poManualCount" style="font-size:18px;">-</div></div>
+      <div class="kpi" style="padding:10px 14px;flex:0 0 auto;"><div class="label">自动放单金额占比</div><div class="val" id="poAutoPct" style="font-size:18px;">-</div></div>
+    </div>
+    <div class="scroll" id="poLevelTable"></div>
+    <div class="note" id="poGovernance"></div>
   </div>
 
   <div class="panel" id="scenPanel">
@@ -217,7 +250,7 @@ const MATERIALS = {
   M001: { name: 'M001 原材料', type: 'Raw', cost: 5,  lead: 7,  supplier: 'S1', stock: 3600, safety: 300 },
   M002: { name: 'M002 组件',   type: 'Comp', cost: 12, lead: 14, supplier: 'S2', stock: 3400, safety: 150 },
   M003: { name: 'M003 组件',   type: 'Comp', cost: 8,  lead: 5,  supplier: 'S3', stock: 7600, safety: 200 },
-  M004: { name: 'M004 关键长交期件', type: 'Comp', cost: 18, lead: 21, supplier: 'S4', stock: 200, safety: 100 }
+  M004: { name: 'M004 关键长交期件', type: 'Comp', cost: 18, lead: 21, supplier: 'S4', stock: 200, safety: 100, critical: true }
 };
 
 // 成品安全库存（件）
@@ -247,6 +280,11 @@ const BASE_ORDERS = [
   { product: 'P-C', qty: 470, week: 4 }
 ];
 
+// 当前计划需求来源：默认既有订单；开启"需求预测"后替换为预测值
+let ACTIVE_ORDERS = BASE_ORDERS;
+// 若使用预测需求，则记录其来源，供在 UI 中标注
+let USE_FORECAST = false;
+
 // 在途（本周起未来到货，周数组长度 N_WEEKS）
 const SCHED_RECEIPTS = {
   M001: { 1: 300 },
@@ -267,7 +305,7 @@ function runPlan(mult, capacity, opts) {
   // 需求
   const demand = {};   // demand[week][prod]
   const orders = [];
-  BASE_ORDERS.forEach(o => {
+  ACTIVE_ORDERS.forEach(o => {
     const q = Math.round(o.qty * mult);
     if (q <= 0) return;
     demand[o.week] = demand[o.week] || {};
@@ -422,6 +460,9 @@ function horizBars(elId, rows) {
 function el(tag, html) { return `<${tag}>` + (html || '') + `</${tag}>`; }
 /* ============ 4. 组装界面 ============ */
 function render(mult, capacity) {
+  USE_FORECAST = !!(document.getElementById('useForecast') && document.getElementById('useForecast').checked);
+  ACTIVE_ORDERS = USE_FORECAST ? buildForecastOrders() : BASE_ORDERS;
+  renderForecast();
   const r = runPlan(mult, capacity);
   const po = summarizePurchase(r.purchase);
 
@@ -517,6 +558,7 @@ function render(mult, capacity) {
   });
   ot += '</tbody></table>';
   document.getElementById('poTable').innerHTML = ot;
+  renderPOs(r, parseInt(document.getElementById('autoCap').value) || 0);
 
   // 预警
   const wl = [];
@@ -640,7 +682,7 @@ function mrpFor(prodMat) {
 // 评估一个计划：产能硬约束（每周总产量上限=capacity），缺料计入短缺成本
 function evaluate(prodMat, mult, capacity) {
   const demand = {};
-  BASE_ORDERS.forEach(o => {
+  ACTIVE_ORDERS.forEach(o => {
     const q = Math.round(o.qty * mult);
     if (q <= 0) return;
     demand[o.week] = demand[o.week] || {};
@@ -693,7 +735,7 @@ function evaluate(prodMat, mult, capacity) {
 // 成本优化：按需生产（lot-for-lot，最小化在库持有）＋ 产能均衡（过载提前到最近空闲周）
 function optimizePlan(capacity, mult) {
   const demand = {};
-  BASE_ORDERS.forEach(o => {
+  ACTIVE_ORDERS.forEach(o => {
     const q = Math.round(o.qty * mult);
     if (q <= 0) return;
     demand[o.week] = demand[o.week] || {};
@@ -818,6 +860,130 @@ function renderOptimize(mult, capacity) {
     `方法说明：成本模型含生产成本（€${PROD_COST['P-A']}~${PROD_COST['P-C']}/件）、持有成本（€${HOLD_COST['P-A']}~${HOLD_COST['P-C']}/件·周）、缺料成本（€${SHORT_COST}/件）与超产能加班成本（€${OVERTIME_COST}/件）。优化在周产能硬约束下做“按需投产（lot-for-lot）+ 容量均衡”，最小化持有与加班/缺料成本（启发式求解，可扩展到 MILP）。`;
 }
 
+/* ============ 7. 采购订单生成与分级（Auto vs 人工） ============ */
+function renderPOs(r, cap) {
+  let auto = 0, manu = 0, autoAmt = 0, manuAmt = 0, rows = '';
+  r.purchase.forEach((o, idx) => {
+    const mat = MATERIALS[o.material];
+    const amt = o.qty * mat.cost;
+    const highVal = cap > 0 && amt >= cap;
+    const critical = !!(mat.critical);
+    const escalate = !!(o.urgent || highVal || critical);
+    const why = [];
+    if (o.urgent) why.push('提前期越界');
+    if (critical) why.push('关键长交期件');
+    if (highVal) why.push('金额超阈值');
+    const poNo = 'PO-' + String(idx + 1).padStart(4, '0');
+    rows += `<tr><td><b>${poNo}</b></td><td>${o.material} ${mat.name}</td><td>${mat.supplier}</td>
+      <td>${fmt(o.qty)}</td><td>${money(amt)}</td><td>W${o.orderWeek}→W${o.arrivalWeek}</td>
+      <td>${escalate ? '<span class="pill warn">需人工审批</span>' : '<span class="pill ok">AI 自动放单</span>'}</td>
+      <td>${why.length ? why.join('、') : '标准补货'}</td></tr>`;
+    if (escalate) { manu++; manuAmt += amt; } else { auto++; autoAmt += amt; }
+  });
+  document.getElementById('poLevelTable').innerHTML =
+    `<table><thead><tr><th>订单号</th><th>物料</th><th>供应商</th><th>数量</th><th>金额</th><th>下单→到货</th><th>审批等级</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table>`;
+  document.getElementById('poAutoCount').textContent = auto + ' 笔';
+  document.getElementById('poManualCount').textContent = manu + ' 笔';
+  const totalAmt = autoAmt + manuAmt;
+  document.getElementById('poAutoPct').textContent = totalAmt ? (autoAmt / totalAmt * 100).toFixed(0) + '%' : '-';
+  document.getElementById('poGovernance').textContent =
+    `分级规则：不超提前期、金额低于 €${fmt(cap)}、且非关键长交期件 → AI 自动放单；涉及提前期越界、关键长交期件或金额达到阈值 → 升级人工审批。低风险标准单交给 AI，关键/高风险单保留给人做商业判断——体现“人机协同”的分工。`;
+}
+
+/* ============ 8. 需求预测（轻量时间序列，纯 JS） ============ */
+// 模拟历史周销量（上升趋势 + 小幅波动），作为预测模型训练输入
+const HISTORY = {
+  'P-A': [960, 1000, 1030, 1070, 1110, 1140, 1180, 1220, 1260, 1300, 1340, 1380],
+  'P-B': [700, 720, 745, 765, 790, 815, 840, 865, 890, 915, 940, 965],
+  'P-C': [360, 372, 384, 396, 408, 420, 432, 444, 456, 468, 480, 490]
+};
+
+// 线性趋势回归（Holt 线性趋势的一阶最小二乘形式）：y = a + b·t
+function trendForecast(history, n) {
+  const m = history.length;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  history.forEach((y, i) => { const x = i + 1; sx += x; sy += y; sxx += x * x; sxy += x * y; });
+  const den = m * sxx - sx * sx;
+  const b = (den !== 0) ? (m * sxy - sx * sy) / den : 0;
+  const a = (sy - b * sx) / m;
+  return Array.from({ length: n }, (_, i) => Math.max(0, Math.round(a + b * (m + i + 1))));
+}
+
+// 滚动留出验证：前 10 周训练、后 2 周测试，算 MAPE（诚实给出准确率）
+function holdoutMAPE(history) {
+  const train = history.slice(0, history.length - 2);
+  const test = history.slice(history.length - 2);
+  const fc = trendForecast(train, test.length);
+  let e = 0;
+  test.forEach((y, i) => { e += Math.abs(fc[i] - y) / (y || 1); });
+  return (e / test.length * 100).toFixed(1);
+}
+
+// 由预测生成计划期订单
+function buildForecastOrders() {
+  const orders = [];
+  PRODUCTS.forEach(p => {
+    trendForecast(HISTORY[p], N_WEEKS).forEach((q, i) => { if (q > 0) orders.push({ product: p, qty: q, week: i + 1 }); });
+  });
+  return orders;
+}
+
+// 组合折线图：历史(实线) + 预测(虚线)，竖线为预测分界
+function drawForecastChart() {
+  const el = document.getElementById('fcChart');
+  const W = el.clientWidth || 1000, H = 230, padL = 40, padR = 14, padT = 14, padB = 24;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const histLen = HISTORY['P-A'].length;
+  const points = histLen + N_WEEKS;
+  const colors = { 'P-A': '#38bdf8', 'P-B': '#22d3ee', 'P-C': '#a78bfa' };
+  let all = [];
+  PRODUCTS.forEach(p => all = all.concat(HISTORY[p], trendForecast(HISTORY[p], N_WEEKS)));
+  const lo = Math.min(...all), hi = Math.max(...all);
+  const span = (hi - lo) || 1;
+  const X = i => padL + innerW * i / (points - 1);
+  const Y = v => padT + innerH - innerH * (v - lo) / span;
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}">`;
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + innerH * g / 4;
+    const v = hi - span * g / 4;
+    s += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>`;
+    s += `<text x="${padL-5}" y="${y+4}" fill="#94a3b8" font-size="10" text-anchor="end">${Math.round(v)}</text>`;
+  }
+  const dx = X(histLen - 1);
+  s += `<line x1="${dx.toFixed(1)}" y1="${padT}" x2="${dx.toFixed(1)}" y2="${padT+innerH}" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>`;
+  s += `<text x="${dx-4}" y="${padT-3}" fill="#94a3b8" font-size="9" text-anchor="middle">←历史</text>`;
+  s += `<text x="${dx+8}" y="${padT-3}" fill="#94a3b8" font-size="9">预测→</text>`;
+  PRODUCTS.forEach(p => {
+    const hist = HISTORY[p];
+    const fc = trendForecast(HISTORY[p], N_WEEKS);
+    const ptsAll = hist.concat(fc);
+    let histPts = '', forePts = '';
+    ptsAll.forEach((v, i) => {
+      const pt = `${X(i).toFixed(1)},${Y(v).toFixed(1)}`;
+      if (i < histLen) histPts += (histPts ? ' ' : '') + pt;
+      else forePts += (forePts ? ' ' : '') + pt;
+    });
+    s += `<polyline points="${histPts}" fill="none" stroke="${colors[p]}" stroke-width="2"/>`;
+    s += `<polyline points="${forePts}" fill="none" stroke="${colors[p]}" stroke-width="2" stroke-dasharray="5 3" opacity="0.85"/>`;
+    s += `<text x="${X(points-1).toFixed(1)}" y="${Y(fc[fc.length-1])-4}" fill="${colors[p]}" font-size="10" text-anchor="end">${p}·${fc[fc.length-1]}</text>`;
+  });
+  s += '</svg>';
+  el.innerHTML = s;
+}
+
+function renderForecast() {
+  drawForecastChart();
+  let rows = '';
+  PRODUCTS.forEach(p => {
+    const fc = trendForecast(HISTORY[p], N_WEEKS);
+    rows += `<tr><td><b>${p}</b></td>${fc.map(q => `<td>${fmt(q)}</td>`).join('')}<td><b>${fmt(fc.reduce((a,b)=>a+b,0))}</b></td><td>${holdoutMAPE(HISTORY[p])}%</td></tr>`;
+  });
+  document.getElementById('fcTable').innerHTML =
+    `<table><thead><tr><th>产品</th>${Array.from({length:N_WEEKS},(_,i)=>`<th>预测W${i+1}</th>`).join('')}<th>合计</th><th>留出MAPE</th></tr></thead><tbody>${rows}</tbody></table>`;
+  document.getElementById('fcSource').textContent =
+    USE_FORECAST ? '当前计划需求 = 需求预测输出（AI 依趋势调整备货）。' : '当前计划需求 = 既有客户订单（可勾选上方“使用预测需求”切换）。';
+}
+
 function init() {
   const multEl = document.getElementById('demMult');
   const valEl = document.getElementById('demVal');
@@ -831,6 +997,8 @@ function init() {
   multEl.addEventListener('input', refresh);
   document.getElementById('recalc').addEventListener('click', refresh);
   document.getElementById('scenario').addEventListener('change', refresh);
+  document.getElementById('autoCap').addEventListener('change', refresh);
+  document.getElementById('useForecast').addEventListener('change', refresh);
   capEl.addEventListener('change', refresh);
   window.addEventListener('resize', () => refresh());
   refresh();
